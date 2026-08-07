@@ -3,6 +3,14 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 
+from smc_utils import (
+    ALINEACION_TOLERANCIA,
+    poc_multi_tf_alineado,
+    poc_promedio,
+    poc_rango,
+    resultado,
+)
+
 app = FastAPI(title="API de Validación SMC - XAU/USD", version="1.0")
 
 # --- Simulación de POCs alineados (en producción, vendrían de tu sistema o API externa) ---
@@ -13,47 +21,33 @@ POC_REFERENCIA = {
     "1h": 2635.2
 }
 
-# Alineación permitida: ±$2.0
-ALINEACION_TOLERANCIA = 2.0
-
-def poc_multi_tf_alineado(pocs_recibidos: dict) -> bool:
-    """Verifica si los POCs están alineados dentro de tolerancia"""
-    valores = list(pocs_recibidos.values())
-    rango = max(valores) - min(valores)
-    return rango <= ALINEACION_TOLERANCIA
-
 def validar_senal_smc(
     direccion: str,
     precio_actual: float,
     pocs: dict  # ej: {"5m": 2635, "15m": 2634.8, "1h": 2635.2}
 ) -> dict:
     """Valida señal según estrategia SMC Scalping"""
-    alineado = poc_multi_tf_alineado(pocs)
-    
-    if not alineado:
-        return {
-            "valida": False,
-            "motivo": "POCs no alineados (rango excede tolerancia)",
-            "rango_pocs": max(pocs.values()) - min(pocs.values())
-        }
+    if not poc_multi_tf_alineado(pocs):
+        return resultado(
+            False,
+            "POCs no alineados (rango excede tolerancia)",
+            rango_pocs=poc_rango(pocs),
+        )
 
-    # POC promedio para comparar
-    poc_promedio = sum(pocs.values()) / len(pocs)
+    promedio = poc_promedio(pocs)
+    direccion = direccion.upper()
 
-    if direccion.upper() == "BUY":
-        if precio_actual > poc_promedio:
-            return {"valida": True, "motivo": "✅ BUY válida: POCs alineados + precio > POC"}
-        else:
-            return {"valida": False, "motivo": "❌ BUY inválida: precio NO supera POC"}
-    
-    elif direccion.upper() == "SELL":
-        if precio_actual < poc_promedio:
-            return {"valida": True, "motivo": "✅ SELL válida: POCs alineados + precio < POC"}
-        else:
-            return {"valida": False, "motivo": "❌ SELL inválida: precio NO está bajo POC"}
-    
-    else:
-        return {"valida": False, "motivo": "Dirección no reconocida (usa BUY/SELL)"}
+    if direccion == "BUY":
+        if precio_actual > promedio:
+            return resultado(True, "✅ BUY válida: POCs alineados + precio > POC")
+        return resultado(False, "❌ BUY inválida: precio NO supera POC")
+
+    if direccion == "SELL":
+        if precio_actual < promedio:
+            return resultado(True, "✅ SELL válida: POCs alineados + precio < POC")
+        return resultado(False, "❌ SELL inválida: precio NO está bajo POC")
+
+    return resultado(False, "Dirección no reconocida (usa BUY/SELL)")
 
 # --- Modelos de datos ---
 class SenalSMC(BaseModel):
