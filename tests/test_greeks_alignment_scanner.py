@@ -3,6 +3,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from chain_providers import BrokerGreeks, ContractQuote  # noqa: E402  (path set up above)
@@ -14,7 +16,10 @@ from greeks_alignment_scanner import (  # noqa: E402
     _score,
     _tos_symbol,
     black_scholes_greeks,
+    build_parser,
+    rank_setups,
     render_markdown,
+    reported_setups,
     scan_ticker,
 )
 
@@ -73,6 +78,40 @@ def test_score_is_highest_for_a_centered_balanced_setup():
     )
     assert best == 100.0
     assert worst < 10.0
+
+
+def test_zero_thresholds_disable_a_band_instead_of_dividing_by_zero():
+    metrics = {"abs_delta": 0.9, "gamma_theta_ratio": 0.1, "theta_burn": 0.5, "vega_ratio": 2.0}
+    disabled = AlignmentThresholds(
+        min_abs_delta=0.5,
+        max_abs_delta=0.5,
+        min_gamma_theta_ratio=0.0,
+        max_theta_burn=0.0,
+        max_vega_ratio=0.0,
+    )
+    assert _score(metrics, disabled) == 100.0
+
+
+def test_top_must_be_at_least_one():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["SPY", "--top", "-1"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["SPY", "--top", "0"])
+
+
+def test_reported_setups_applies_aligned_only_and_top():
+    setups = scan_ticker(
+        _FakeProvider(),
+        "FAKE",
+        min_dte=7,
+        max_dte=45,
+        rate=0.0,
+        thresholds=AlignmentThresholds(),
+        liquidity=LiquidityFilters(),
+        today=date(2026, 2, 1),
+    )
+    assert len(rank_setups(setups)) == 2
+    assert len(reported_setups(setups, top_n=1, aligned_only=True)) == 1
 
 
 def test_tos_symbol_format():

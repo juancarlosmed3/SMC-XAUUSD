@@ -140,15 +140,31 @@ def _tos_symbol(ticker: str, expiration: str, side: Side, strike: float) -> str:
 
 
 def _score(setup_metrics: dict[str, float], thresholds: AlignmentThresholds) -> float:
-    """0-100 score. Rewards balanced delta, convexity per unit decay and cheap vega."""
+    """0-100 score. Rewards balanced delta, convexity per unit decay and cheap vega.
+
+    A threshold of zero (or a zero-width delta band) disables that band, so the
+    corresponding sub-score is a full mark rather than a division by zero.
+    """
     abs_delta = setup_metrics["abs_delta"]
     center = (thresholds.min_abs_delta + thresholds.max_abs_delta) / 2.0
     half_width = (thresholds.max_abs_delta - thresholds.min_abs_delta) / 2.0
-    delta_score = max(0.0, 1.0 - abs(abs_delta - center) / half_width)
+    delta_score = max(0.0, 1.0 - abs(abs_delta - center) / half_width) if half_width > 0.0 else 1.0
 
-    gamma_score = min(1.0, setup_metrics["gamma_theta_ratio"] / thresholds.min_gamma_theta_ratio)
-    theta_score = max(0.0, 1.0 - setup_metrics["theta_burn"] / thresholds.max_theta_burn)
-    vega_score = max(0.0, 1.0 - setup_metrics["vega_ratio"] / thresholds.max_vega_ratio)
+    gamma_score = (
+        min(1.0, setup_metrics["gamma_theta_ratio"] / thresholds.min_gamma_theta_ratio)
+        if thresholds.min_gamma_theta_ratio > 0.0
+        else 1.0
+    )
+    theta_score = (
+        max(0.0, 1.0 - setup_metrics["theta_burn"] / thresholds.max_theta_burn)
+        if thresholds.max_theta_burn > 0.0
+        else 1.0
+    )
+    vega_score = (
+        max(0.0, 1.0 - setup_metrics["vega_ratio"] / thresholds.max_vega_ratio)
+        if thresholds.max_vega_ratio > 0.0
+        else 1.0
+    )
 
     return round(100.0 * (0.30 * delta_score + 0.30 * gamma_score + 0.25 * theta_score + 0.15 * vega_score), 1)
 
@@ -201,7 +217,7 @@ def _evaluate_chain(
         if not thresholds.min_abs_delta <= metrics["abs_delta"] <= thresholds.max_abs_delta:
             notes.append(f"delta {metrics['abs_delta']:.2f} outside {thresholds.min_abs_delta}-{thresholds.max_abs_delta}")
         if metrics["gamma_theta_ratio"] < thresholds.min_gamma_theta_ratio:
-            notes.append(f"gamma/theta {metrics['gamma_theta_ratio']:.2f} below {thresholds.min_gamma_theta_ratio}")
+            notes.append(f"gamma/theta {metrics['gamma_theta_ratio']:.3f} below {thresholds.min_gamma_theta_ratio}")
         if metrics["theta_burn"] > thresholds.max_theta_burn:
             notes.append(f"theta burn {metrics['theta_burn']:.1%}/day above {thresholds.max_theta_burn:.1%}")
         if metrics["vega_ratio"] > thresholds.max_vega_ratio:
@@ -253,7 +269,7 @@ def scan_ticker(
     today = today or datetime.now(timezone.utc).date()
     spot = provider.spot(ticker)
     if spot is None:
-        return []
+        raise ValueError(f"no price data for {ticker}")
 
     dividend_yield = provider.dividend_yield(ticker)
 
@@ -278,11 +294,20 @@ def scan_ticker(
     return setups
 
 
-def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool, source: str = "yahoo") -> str:
-    ranked = sorted(setups, key=lambda s: (s.aligned, s.score), reverse=True)
+def rank_setups(setups: Iterable[Setup]) -> list[Setup]:
+    """Aligned setups first, then by score."""
+    return sorted(setups, key=lambda s: (s.aligned, s.score), reverse=True)
+
+
+def reported_setups(setups: Iterable[Setup], top_n: int, aligned_only: bool) -> list[Setup]:
+    ranked = rank_setups(setups)
     if aligned_only:
         ranked = [s for s in ranked if s.aligned]
-    ranked = ranked[:top_n]
+    return ranked[:top_n]
+
+
+def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool, source: str = "yahoo") -> str:
+    ranked = reported_setups(setups, top_n, aligned_only)
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Greeks alignment scan — {stamp} (source: {source})", ""]
@@ -327,6 +352,13 @@ def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool, sou
     return "\n".join(lines)
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be 1 or greater")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tickers", nargs="+", help="Underlying symbols, e.g. SPY QQQ AAPL")
@@ -348,7 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-dte", type=int, default=7)
     parser.add_argument("--max-dte", type=int, default=45)
     parser.add_argument("--rate", type=float, default=0.04, help="Risk-free rate as a decimal")
-    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--top", type=_positive_int, default=10)
     parser.add_argument("--side", choices=["call", "put", "both"], default="both")
     parser.add_argument("--aligned-only", action="store_true", help="Drop contracts that miss any greek band")
     parser.add_argument("--min-abs-delta", type=float, default=AlignmentThresholds.min_abs_delta)
@@ -359,7 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-open-interest", type=int, default=LiquidityFilters.min_open_interest)
     parser.add_argument("--min-volume", type=int, default=LiquidityFilters.min_volume)
     parser.add_argument("--max-spread-pct", type=float, default=LiquidityFilters.max_spread_pct)
-    parser.add_argument("--json-out", help="Also write the raw ranked setups to this JSON path")
+    parser.add_argument(
+        "--json-out",
+        help="Also write the reported setups to this JSON path (same rows as the table)",
+    )
+    parser.add_argument(
+        "--json-all",
+        action="store_true",
+        help="Write every scanned contract to --json-out instead of only the reported rows",
+    )
     parser.add_argument("--markdown-out", help="Write the markdown report to this path instead of stdout only")
     return parser
 
@@ -395,6 +435,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         provider = build_provider("yahoo")
 
     all_setups: list[Setup] = []
+    failed: list[str] = []
     try:
         for ticker in args.tickers:
             try:
@@ -404,7 +445,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
                 )
             except Exception as exc:  # a single bad symbol must not kill the scan
-                print(f"warning: {ticker}: {exc}", file=sys.stderr)
+                failed.append(ticker)
+                print(f"warning: {ticker}: {type(exc).__name__}: {exc}", file=sys.stderr)
     finally:
         close = getattr(provider, "close", None)
         if callable(close):
@@ -420,11 +462,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         with open(args.markdown_out, "w") as handle:
             handle.write(report + "\n")
     if args.json_out:
-        ranked = sorted(all_setups, key=lambda s: (s.aligned, s.score), reverse=True)
+        exported = rank_setups(all_setups) if args.json_all else reported_setups(
+            all_setups, args.top, args.aligned_only
+        )
         with open(args.json_out, "w") as handle:
-            json.dump([asdict(s) for s in ranked], handle, indent=2)
+            json.dump([asdict(s) for s in exported], handle, indent=2)
 
-    return 0
+    # An empty report because every ticker errored must not look like a clean scan.
+    return 1 if len(failed) == len(args.tickers) else 0
 
 
 if __name__ == "__main__":
