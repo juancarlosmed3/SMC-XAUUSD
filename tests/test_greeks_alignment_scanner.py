@@ -1,16 +1,21 @@
 import math
 import sys
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from greeks_alignment_scanner import (  # noqa: E402  (path set up above)
+from chain_providers import BrokerGreeks, ContractQuote  # noqa: E402  (path set up above)
+from greeks_alignment_scanner import (  # noqa: E402
     AlignmentThresholds,
+    LiquidityFilters,
     _as_float,
+    _evaluate_chain,
     _score,
     _tos_symbol,
     black_scholes_greeks,
     render_markdown,
+    scan_ticker,
 )
 
 SPOT = 100.0
@@ -77,3 +82,69 @@ def test_tos_symbol_format():
 
 def test_render_markdown_without_results():
     assert "No contracts passed" in render_markdown([], top_n=5, aligned_only=True)
+
+
+class _FakeProvider:
+    """Two ATM contracts and one illiquid one, without touching the network."""
+
+    name = "fake"
+
+    def spot(self, ticker):
+        return 100.0
+
+    def dividend_yield(self, ticker):
+        return 0.0
+
+    def expirations(self, ticker):
+        return ["2026-03-02", "2027-01-15"]
+
+    def quotes(self, ticker, expiration):
+        return [
+            ContractQuote("call", 100.0, 4.9, 5.1, 5000, 400, 0.25, "FAKE260302C100"),
+            ContractQuote("put", 100.0, 4.7, 4.9, 4000, 300, 0.25, "FAKE260302P100"),
+            ContractQuote("call", 150.0, 0.05, 0.30, 3, 0, 0.60, "FAKE260302C150"),
+        ]
+
+
+def test_scan_ticker_filters_by_dte_and_liquidity():
+    setups = scan_ticker(
+        _FakeProvider(),
+        "FAKE",
+        min_dte=7,
+        max_dte=45,
+        rate=0.0,
+        thresholds=AlignmentThresholds(),
+        liquidity=LiquidityFilters(),
+        today=date(2026, 2, 1),
+    )
+    # Only the 2026-03-02 expiry is inside the DTE window, and the wide-spread
+    # 150 strike is dropped before greeks are computed.
+    assert {(s.side, s.strike) for s in setups} == {("call", 100.0), ("put", 100.0)}
+    assert all(s.dte == 29 for s in setups)
+    assert all(s.aligned for s in setups)
+
+
+def test_broker_greeks_are_used_verbatim_when_the_source_supplies_them():
+    quote = ContractQuote(
+        "call",
+        100.0,
+        4.9,
+        5.1,
+        5000,
+        400,
+        0.25,
+        "FAKE260302C100",
+        greeks=BrokerGreeks(delta=0.42, gamma=0.031, theta=-0.055, vega=0.111),
+    )
+    [setup] = _evaluate_chain(
+        "FAKE",
+        [quote],
+        spot=100.0,
+        expiration="2026-03-02",
+        dte=29,
+        rate=0.04,
+        dividend_yield=0.02,
+        thresholds=AlignmentThresholds(),
+        liquidity=LiquidityFilters(),
+    )
+    assert (setup.delta, setup.gamma, setup.theta, setup.vega) == (0.42, 0.031, -0.055, 0.111)

@@ -1,9 +1,10 @@
 """Options Greeks alignment scanner for directional call/put setups.
 
-Scans option chains, computes Black-Scholes greeks from implied volatility and
-ranks contracts where delta, gamma, theta and vega are simultaneously aligned
-for a long call or long put thesis. Output is a markdown report suitable for
-manually placing the trade in thinkorswim.
+Scans option chains and ranks contracts where delta, gamma, theta and vega are
+simultaneously aligned for a long call or long put thesis. Greeks come from the
+broker when the source publishes them (IBKR) and are otherwise computed from
+implied volatility with Black-Scholes (Yahoo). Output is a markdown report
+suitable for manually placing the trade in thinkorswim.
 """
 
 from __future__ import annotations
@@ -14,12 +15,18 @@ import math
 import sys
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Optional
 
-import pandas as pd
-import yfinance as yf
-
-Side = Literal["call", "put"]
+from chain_providers import (
+    IBKR_DEFAULT_CLIENT_ID,
+    IBKR_DEFAULT_HOST,
+    IBKR_DEFAULT_PORT,
+    ChainProvider,
+    ContractQuote,
+    Side,
+    as_float as _as_float,
+    build_provider,
+)
 
 TRADING_DAYS = 252.0
 CALENDAR_DAYS = 365.0
@@ -31,15 +38,6 @@ def _norm_pdf(x: float) -> float:
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _as_float(value: object, default: float = 0.0) -> float:
-    """yfinance leaves NaN/None in quote columns for untraded contracts."""
-    try:
-        result = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-    return default if math.isnan(result) else result
 
 
 @dataclass(frozen=True)
@@ -155,33 +153,9 @@ def _score(setup_metrics: dict[str, float], thresholds: AlignmentThresholds) -> 
     return round(100.0 * (0.30 * delta_score + 0.30 * gamma_score + 0.25 * theta_score + 0.15 * vega_score), 1)
 
 
-def _dividend_yield(tk: yf.Ticker) -> float:
-    """Annual dividend yield as a decimal.
-
-    yfinance reports `dividendYield` in percent (0.44 means 0.44%) while
-    `trailingAnnualDividendYield` is already a fraction, so prefer the latter.
-    """
-    try:
-        info = tk.info
-    except Exception:
-        return 0.0
-    trailing = _as_float(info.get("trailingAnnualDividendYield"))
-    if trailing > 0.0:
-        return trailing
-    return _as_float(info.get("dividendYield")) / 100.0
-
-
-def _spot_price(tk: yf.Ticker) -> Optional[float]:
-    history = tk.history(period="5d", interval="1d")
-    if history.empty:
-        return None
-    return float(history["Close"].iloc[-1])
-
-
 def _evaluate_chain(
     ticker: str,
-    side: Side,
-    chain: pd.DataFrame,
+    quotes: Iterable[ContractQuote],
     spot: float,
     expiration: str,
     dte: int,
@@ -193,26 +167,22 @@ def _evaluate_chain(
     setups: list[Setup] = []
     years = max(dte, 0) / CALENDAR_DAYS
 
-    for row in chain.itertuples():
-        bid = _as_float(getattr(row, "bid", 0.0))
-        ask = _as_float(getattr(row, "ask", 0.0))
+    for quote in quotes:
+        bid, ask = quote.bid, quote.ask
         if bid <= 0.0 or ask <= 0.0:
             continue
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid
-        open_interest = int(_as_float(getattr(row, "openInterest", 0.0)))
-        volume = int(_as_float(getattr(row, "volume", 0.0)))
-        iv = _as_float(getattr(row, "impliedVolatility", 0.0))
-        strike = _as_float(row.strike)
+        side, strike, iv = quote.side, quote.strike, quote.iv
 
         if mid < liquidity.min_premium or spread_pct > liquidity.max_spread_pct:
             continue
-        if open_interest < liquidity.min_open_interest or volume < liquidity.min_volume:
+        if quote.open_interest < liquidity.min_open_interest or quote.volume < liquidity.min_volume:
             continue
         if iv <= 0.0 or iv > thresholds.max_iv:
             continue
 
-        greeks = black_scholes_greeks(side, spot, strike, years, iv, rate, dividend_yield)
+        greeks = quote.greeks or black_scholes_greeks(side, spot, strike, years, iv, rate, dividend_yield)
         theta_per_day = abs(greeks.theta)
         if theta_per_day < 1e-4:
             continue
@@ -241,7 +211,7 @@ def _evaluate_chain(
             Setup(
                 ticker=ticker,
                 side=side,
-                contract_symbol=str(row.contractSymbol),
+                contract_symbol=quote.contract_symbol,
                 tos_symbol=_tos_symbol(ticker, expiration, side, strike),
                 expiration=expiration,
                 dte=dte,
@@ -251,8 +221,8 @@ def _evaluate_chain(
                 bid=bid,
                 ask=ask,
                 spread_pct=round(spread_pct, 4),
-                open_interest=open_interest,
-                volume=volume,
+                open_interest=quote.open_interest,
+                volume=quote.volume,
                 iv=round(iv, 4),
                 delta=round(greeks.delta, 4),
                 gamma=round(greeks.gamma, 5),
@@ -271,6 +241,7 @@ def _evaluate_chain(
 
 
 def scan_ticker(
+    provider: ChainProvider,
     ticker: str,
     min_dte: int,
     max_dte: int,
@@ -280,36 +251,41 @@ def scan_ticker(
     today: Optional[date] = None,
 ) -> list[Setup]:
     today = today or datetime.now(timezone.utc).date()
-    tk = yf.Ticker(ticker)
-    spot = _spot_price(tk)
+    spot = provider.spot(ticker)
     if spot is None:
         return []
 
-    dividend_yield = _dividend_yield(tk)
+    dividend_yield = provider.dividend_yield(ticker)
 
     setups: list[Setup] = []
-    for expiration in tk.options:
+    for expiration in provider.expirations(ticker):
         dte = (datetime.strptime(expiration, "%Y-%m-%d").date() - today).days
         if not min_dte <= dte <= max_dte:
             continue
-        chain = tk.option_chain(expiration)
-        for side, frame in (("call", chain.calls), ("put", chain.puts)):
-            setups.extend(
-                _evaluate_chain(
-                    ticker, side, frame, spot, expiration, dte, rate, dividend_yield, thresholds, liquidity
-                )
+        setups.extend(
+            _evaluate_chain(
+                ticker,
+                provider.quotes(ticker, expiration),
+                spot,
+                expiration,
+                dte,
+                rate,
+                dividend_yield,
+                thresholds,
+                liquidity,
             )
+        )
     return setups
 
 
-def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool) -> str:
+def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool, source: str = "yahoo") -> str:
     ranked = sorted(setups, key=lambda s: (s.aligned, s.score), reverse=True)
     if aligned_only:
         ranked = [s for s in ranked if s.aligned]
     ranked = ranked[:top_n]
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"# Greeks alignment scan — {stamp}", ""]
+    lines = [f"# Greeks alignment scan — {stamp} (source: {source})", ""]
     if not ranked:
         lines.append("No contracts passed the liquidity filters and greek alignment bands.")
         return "\n".join(lines)
@@ -331,7 +307,14 @@ def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool) -> 
         for s in misaligned:
             lines.append(f"- `{s.tos_symbol}`: " + "; ".join(s.notes))
 
+    source_note = (
+        "Greeks are IBKR model greeks taken straight from the live chain."
+        if source == "ibkr"
+        else "Quotes are delayed roughly 15 minutes and greeks are computed locally from implied volatility."
+    )
     lines += [
+        "",
+        f"_{source_note}_",
         "",
         "## Reading the columns",
         "",
@@ -347,6 +330,21 @@ def render_markdown(setups: Iterable[Setup], top_n: int, aligned_only: bool) -> 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tickers", nargs="+", help="Underlying symbols, e.g. SPY QQQ AAPL")
+    parser.add_argument(
+        "--source",
+        choices=["yahoo", "ibkr"],
+        default="yahoo",
+        help="yahoo: free, ~15 min delayed, greeks computed locally. "
+        "ibkr: live quotes and IBKR model greeks, needs a running TWS/IB Gateway.",
+    )
+    parser.add_argument("--ibkr-host", default=IBKR_DEFAULT_HOST)
+    parser.add_argument(
+        "--ibkr-port",
+        type=int,
+        default=IBKR_DEFAULT_PORT,
+        help="7497 TWS paper, 7496 TWS live, 4002 Gateway paper, 4001 Gateway live",
+    )
+    parser.add_argument("--ibkr-client-id", type=int, default=IBKR_DEFAULT_CLIENT_ID)
     parser.add_argument("--min-dte", type=int, default=7)
     parser.add_argument("--max-dte", type=int, default=45)
     parser.add_argument("--rate", type=float, default=0.04, help="Risk-free rate as a decimal")
@@ -381,19 +379,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_spread_pct=args.max_spread_pct,
     )
 
-    all_setups: list[Setup] = []
-    for ticker in args.tickers:
+    if args.source == "ibkr":
         try:
-            all_setups.extend(
-                scan_ticker(ticker.upper(), args.min_dte, args.max_dte, args.rate, thresholds, liquidity)
+            provider = build_provider(
+                "ibkr", host=args.ibkr_host, port=args.ibkr_port, client_id=args.ibkr_client_id
             )
-        except Exception as exc:  # a single bad symbol must not kill the scan
-            print(f"warning: {ticker}: {exc}", file=sys.stderr)
+        except (OSError, ImportError) as exc:
+            print(
+                f"error: cannot reach IBKR at {args.ibkr_host}:{args.ibkr_port} ({exc}). "
+                "Start TWS or IB Gateway, log in, and enable API socket clients.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        provider = build_provider("yahoo")
+
+    all_setups: list[Setup] = []
+    try:
+        for ticker in args.tickers:
+            try:
+                all_setups.extend(
+                    scan_ticker(
+                        provider, ticker.upper(), args.min_dte, args.max_dte, args.rate, thresholds, liquidity
+                    )
+                )
+            except Exception as exc:  # a single bad symbol must not kill the scan
+                print(f"warning: {ticker}: {exc}", file=sys.stderr)
+    finally:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
 
     if args.side != "both":
         all_setups = [s for s in all_setups if s.side == args.side]
 
-    report = render_markdown(all_setups, args.top, args.aligned_only)
+    report = render_markdown(all_setups, args.top, args.aligned_only, source=args.source)
     print(report)
 
     if args.markdown_out:
