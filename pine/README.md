@@ -19,6 +19,10 @@ Indicador en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView. No e
 4. Ajustar tolerancia del cluster segun el activo: XAUUSD ≈ 2.0 USD, XAGUSD ≈ 0.05 USD.
 5. Requiere plan de TradingView con acceso a datos intradia del broker/feed correspondiente.
 
+## Visualizacion
+
+Cada POC se dibuja con su color y lleva una etiqueta con el nombre de la temporalidad (M1, M5, M15, M30, H1, H4) y, opcionalmente, el precio. Se controla en el grupo *Visualizacion*: `showPocLabels`, `showPocPrice`, `labelOffset` (velas a la derecha) y `labelSize`. La zona del cluster se sombrea y el fondo se tinta mientras hay una correccion en curso.
+
 ## Alertas → MetaTrader 5 (Swissquote)
 
 Cada senal emite un `alert()` con un JSON como:
