@@ -1,14 +1,16 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0
-//@version=5
+//@version=6
 // POC Cluster Multi-Timeframe (M1/M5/M15/M30/H1/H4) para XAUUSD / XAGUSD (CFD)
 // Logica:
 //   1. Calcula el POC (Point of Control, precio con mayor volumen) por cada temporalidad
 //      usando un perfil de volumen sobre las ultimas `profileBars` velas de cada TF.
 //   2. Detecta "cluster": todos los POC dentro de un rango <= clusterTolerance.
-//   3. Compra cuando el precio cierra por encima del cluster (rotura al alza),
-//      vende cuando cierra por debajo.
-//   4. Filtros: direccion de tendencia con SMA 200 y fuerza con volumen relativo.
-//   5. Emite alertas JSON listas para un puente/webhook hacia MetaTrader 5.
+//   3. Detecta el INICIO de correcciones (pullbacks) tras un impulso: no se operan
+//      los rallys, sino la correccion institucional y su reanudacion.
+//   4. Entra cuando la correccion alcanza el cluster de POC y el precio reanuda la
+//      direccion de la tendencia (o, opcionalmente, por rotura directa del cluster).
+//   5. Filtros: direccion de tendencia con SMA 200 y fuerza con volumen relativo.
+//   6. Emite alertas JSON listas para un puente/webhook hacia MetaTrader 5.
 strategy("POC Cluster Multi-TF (XAUUSD/XAGUSD)", overlay = true, calc_on_every_tick = false,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 5,
      initial_capital = 10000, currency = currency.USD, pyramiding = 0,
@@ -39,6 +41,16 @@ useSmaFilter     = input.bool(true, "Filtrar por SMA", group = grpFilters)
 useVolFilter     = input.bool(true, "Filtrar por volumen", group = grpFilters)
 volLen           = input.int(20, "Media de volumen", minval = 2, group = grpFilters)
 volMult          = input.float(1.5, "Volumen minimo x media", minval = 0.1, step = 0.1, group = grpFilters)
+
+grpPull = "Correcciones (pullbacks)"
+entryMode        = input.string("Pullback", "Modo de entrada", options = ["Pullback", "Rotura directa"], group = grpPull,
+     tooltip = "Pullback: opera la reanudacion tras la correccion. Rotura directa: opera el cruce del cluster.")
+pivotLen         = input.int(5, "Velas del pivote de estructura", minval = 2, group = grpPull)
+impulseAtrMult   = input.float(2.0, "Impulso minimo = ATR x", minval = 0.1, step = 0.1, group = grpPull)
+minRetrace       = input.float(23.6, "Retroceso minimo del impulso (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = grpPull)
+maxRetrace       = input.float(78.6, "Retroceso maximo del impulso (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = grpPull)
+pullbackBars     = input.int(30, "Vigencia de la correccion (velas)", minval = 1, group = grpPull)
+requireClusterTouch = input.bool(true, "Exigir que la correccion toque el cluster", group = grpPull)
 
 grpRisk = "Gestion de riesgo"
 useStops         = input.bool(true, "Usar SL/TP por ATR", group = grpRisk)
@@ -143,8 +155,74 @@ belowCluster = hasCluster and close < clusterLow - breakoutBuffer
 crossUp = aboveCluster and not (hasCluster[1] and close[1] > clusterHigh[1] + breakoutBuffer)
 crossDown = belowCluster and not (hasCluster[1] and close[1] < clusterLow[1] - breakoutBuffer)
 
-longSignal = crossUp and trendUp and volOk
-shortSignal = crossDown and trendDown and volOk
+// ------------------------------------------------- Estructura e impulsos
+// Pivotes confirmados: definen el ultimo swing y por tanto la pierna de impulso.
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastPH = na
+var float lastPL = na
+var int lastPHBar = na
+var int lastPLBar = na
+if not na(ph)
+    lastPH := ph
+    lastPHBar := bar_index - pivotLen
+if not na(pl)
+    lastPL := pl
+    lastPLBar := bar_index - pivotLen
+
+legUp = not na(lastPH) and not na(lastPL) and lastPHBar > lastPLBar ? lastPH - lastPL : na   // impulso alcista terminado en lastPH
+legDown = not na(lastPH) and not na(lastPL) and lastPLBar > lastPHBar ? lastPH - lastPL : na // impulso bajista terminado en lastPL
+impulseUp = not na(legUp) and legUp >= atr * impulseAtrMult
+impulseDown = not na(legDown) and legDown >= atr * impulseAtrMult
+
+// Inicio de la correccion: primera vela que rompe la minima/maxima anterior
+// despues de un impulso confirmado (correccion a la baja tras rally alcista y viceversa).
+var bool inPullDown = false
+var bool inPullUp = false
+var int pullBar = na
+var bool touchedCluster = false
+
+corrDownStart = impulseUp and not inPullDown and close < low[1] and high[1] <= lastPH
+corrUpStart = impulseDown and not inPullUp and close > high[1] and low[1] >= lastPL
+
+if corrDownStart
+    inPullDown := true
+    inPullUp := false
+    pullBar := bar_index
+    touchedCluster := false
+if corrUpStart
+    inPullUp := true
+    inPullDown := false
+    pullBar := bar_index
+    touchedCluster := false
+
+// Profundidad del retroceso respecto a la pierna de impulso.
+retraceDown = inPullDown and not na(legUp) and legUp > 0 ? (lastPH - low) / legUp * 100 : na
+retraceUp = inPullUp and not na(legDown) and legDown > 0 ? (high - lastPL) / legDown * 100 : na
+
+if (inPullDown or inPullUp) and hasCluster and low <= clusterHigh and high >= clusterLow
+    touchedCluster := true
+
+expired = not na(pullBar) and bar_index - pullBar > pullbackBars
+if expired
+    inPullDown := false
+    inPullUp := false
+
+depthOk(r) => not na(r) and r >= minRetrace and r <= maxRetrace
+clusterOk = not requireClusterTouch or touchedCluster
+
+// Reanudacion: la correccion termina cuando el precio vuelve a favor de la tendencia
+// cerrando al otro lado del cluster.
+resumeLong = inPullDown and depthOk(retraceDown) and clusterOk and crossUp
+resumeShort = inPullUp and depthOk(retraceUp) and clusterOk and crossDown
+
+longSignal = (entryMode == "Pullback" ? resumeLong : crossUp) and trendUp and volOk
+shortSignal = (entryMode == "Pullback" ? resumeShort : crossDown) and trendDown and volOk
+
+if longSignal
+    inPullDown := false
+if shortSignal
+    inPullUp := false
 
 // ---------------------------------------------------------------- Ordenes
 if longSignal
@@ -173,6 +251,8 @@ mt5Payload(side) =>
      ',"sma' + str.tostring(smaLen) + '":' + str.tostring(sma, format.mintick) +
      ',"volume":' + str.tostring(volume) +
      ',"volume_avg":' + str.tostring(volAvg) +
+     ',"retrace_pct":' + str.tostring(side == "BUY" ? retraceDown : retraceUp, "#.##") +
+     ',"entry_mode":"' + entryMode + '"' +
      ',"tf":"' + timeframe.period + '"' +
      ',"time":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"}'
 
@@ -180,6 +260,21 @@ if longSignal
     alert(mt5Payload("BUY"), alert.freq_once_per_bar_close)
 if shortSignal
     alert(mt5Payload("SELL"), alert.freq_once_per_bar_close)
+
+// Aviso informativo (no operativo) del inicio de cada correccion.
+corrPayload(dir) =>
+    '{"event":"correction_start","direction":"' + dir + '","symbol":"' + syminfo.ticker + '"' +
+     ',"price":' + str.tostring(close, format.mintick) +
+     ',"impulse_from":' + str.tostring(dir == "DOWN" ? lastPL : lastPH, format.mintick) +
+     ',"impulse_to":' + str.tostring(dir == "DOWN" ? lastPH : lastPL, format.mintick) +
+     ',"poc_cluster_low":' + str.tostring(clusterLow, format.mintick) +
+     ',"poc_cluster_high":' + str.tostring(clusterHigh, format.mintick) +
+     ',"tf":"' + timeframe.period + '"}'
+
+if corrDownStart
+    alert(corrPayload("DOWN"), alert.freq_once_per_bar_close)
+if corrUpStart
+    alert(corrPayload("UP"), alert.freq_once_per_bar_close)
 
 // ---------------------------------------------------------------- Visualizacion
 plot(sma, "SMA tendencia", color.new(color.orange, 0), 2)
@@ -196,8 +291,11 @@ fill(pLow, pHigh, color = hasCluster ? color.new(color.teal, 80) : na, title = "
 
 plotshape(longSignal, "BUY", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
 plotshape(shortSignal, "SELL", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(corrDownStart, "Inicio correccion bajista", shape.xcross, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+plotshape(corrUpStart, "Inicio correccion alcista", shape.xcross, location.belowbar, color.new(color.orange, 0), size = size.tiny)
+bgcolor(inPullDown ? color.new(color.orange, 92) : inPullUp ? color.new(color.yellow, 92) : na, title = "En correccion")
 
-var table info = table.new(position.top_right, 2, 5, border_width = 1)
+var table info = table.new(position.top_right, 2, 7, border_width = 1)
 if barstate.islast
     table.cell(info, 0, 0, "POC en cluster", bgcolor = color.new(color.gray, 80))
     table.cell(info, 1, 0, str.tostring(clusterCount) + " / " + str.tostring(array.size(pocs)))
@@ -209,3 +307,7 @@ if barstate.islast
     table.cell(info, 1, 3, na(sma) ? "n/d" : close > sma ? "alcista" : "bajista")
     table.cell(info, 0, 4, "Volumen vs media", bgcolor = color.new(color.gray, 80))
     table.cell(info, 1, 4, na(volAvg) or volAvg == 0 ? "n/d" : str.tostring(volume / volAvg, "#.##") + "x")
+    table.cell(info, 0, 5, "Correccion", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 5, inPullDown ? "bajista en curso" : inPullUp ? "alcista en curso" : "ninguna")
+    table.cell(info, 0, 6, "Retroceso", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 6, na(retraceDown) and na(retraceUp) ? "n/d" : str.tostring(nz(retraceDown, nz(retraceUp)), "#.#") + "%")
