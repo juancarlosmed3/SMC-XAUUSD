@@ -1,6 +1,6 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0
 //@version=6
-// POC Cluster Multi-Timeframe (M1/M5/M15/M30/H1/H4) para XAUUSD / XAGUSD (CFD)
+// POC Cluster Multi-Timeframe (M1..H4 + D/S/M/12M) para XAUUSD / XAGUSD (CFD)
 // Logica:
 //   1. Calcula el POC (Point of Control, precio con mayor volumen) por cada temporalidad
 //      usando un perfil de volumen sobre las ultimas `profileBars` velas de cada TF.
@@ -25,13 +25,17 @@ useM15           = input.bool(true, "M15", inline = "tf1", group = grpProfile)
 useM30           = input.bool(true, "M30", inline = "tf2", group = grpProfile)
 useH1            = input.bool(true, "H1", inline = "tf2", group = grpProfile)
 useH4            = input.bool(true, "H4", inline = "tf2", group = grpProfile)
+useD             = input.bool(false, "D", inline = "tf3", group = grpProfile)
+useW             = input.bool(false, "S", inline = "tf3", group = grpProfile)
+useMN            = input.bool(false, "M", inline = "tf3", group = grpProfile)
+useY             = input.bool(false, "12M", inline = "tf3", group = grpProfile)
 
 grpCluster = "Cluster"
 clusterMode      = input.string("Puntos", "Modo de tolerancia", options = ["Puntos", "ATR"], group = grpCluster)
 clusterPoints    = input.float(2.0, "Tolerancia en puntos de precio", minval = 0.0, step = 0.1, group = grpCluster,
      tooltip = "XAUUSD: ~2.0 USD. XAGUSD: ~0.05 USD.")
 clusterAtrMult   = input.float(0.5, "Tolerancia = ATR(14) x", minval = 0.05, step = 0.05, group = grpCluster)
-minPocsInCluster = input.int(4, "Minimo de POC en cluster", minval = 2, maxval = 6, group = grpCluster)
+minPocsInCluster = input.int(4, "Minimo de POC en cluster", minval = 2, maxval = 10, group = grpCluster)
 breakoutBuffer   = input.float(0.0, "Buffer de rotura (puntos)", minval = 0.0, step = 0.1, group = grpCluster)
 
 grpFilters = "Filtros"
@@ -43,7 +47,8 @@ volMult          = input.float(1.5, "Volumen minimo x media", minval = 0.1, step
 
 grpView = "Visualizacion"
 showPocLabels    = input.bool(true, "Etiqueta con la temporalidad en cada POC", group = grpView)
-labelOffset      = input.int(3, "Desplazamiento de la etiqueta (velas)", minval = 0, maxval = 50, group = grpView)
+labelOffset      = input.int(0, "Desplazamiento extra de la etiqueta (velas)", minval = 0, maxval = 50, group = grpView,
+     tooltip = "0 = pegada al final de la linea del POC.")
 showPocPrice     = input.bool(true, "Incluir el precio en la etiqueta", group = grpView)
 labelSize        = input.string("tiny", "Tamano de la etiqueta", options = ["tiny", "small", "normal"], group = grpView)
 
@@ -102,6 +107,10 @@ pocM15 = pocOf("15")
 pocM30 = pocOf("30")
 pocH1  = pocOf("60")
 pocH4  = pocOf("240")
+pocD   = pocOf("1D")
+pocW   = pocOf("1W")
+pocMN  = pocOf("1M")
+pocY   = pocOf("12M")
 
 // ---------------------------------------------------------------- Cluster
 atr = ta.atr(atrLen)
@@ -121,6 +130,14 @@ if useH1 and not na(pocH1)
     array.push(pocs, pocH1)
 if useH4 and not na(pocH4)
     array.push(pocs, pocH4)
+if useD and not na(pocD)
+    array.push(pocs, pocD)
+if useW and not na(pocW)
+    array.push(pocs, pocW)
+if useMN and not na(pocMN)
+    array.push(pocs, pocMN)
+if useY and not na(pocY)
+    array.push(pocs, pocY)
 
 // Subconjunto mas denso: la ventana de POC ordenados con menor dispersion.
 float clusterLow = na
@@ -284,6 +301,10 @@ colM15 = color.new(color.blue, 30)
 colM30 = color.new(color.purple, 30)
 colH1 = color.new(color.fuchsia, 20)
 colH4 = color.new(color.red, 10)
+colD = color.new(color.orange, 10)
+colW = color.new(color.lime, 10)
+colMN = color.new(color.yellow, 10)
+colY = color.new(color.white, 10)
 
 plot(useM1 ? pocM1 : na, "POC M1", colM1, 1, plot.style_circles)
 plot(useM5 ? pocM5 : na, "POC M5", colM5, 1, plot.style_circles)
@@ -291,6 +312,10 @@ plot(useM15 ? pocM15 : na, "POC M15", colM15, 1, plot.style_circles)
 plot(useM30 ? pocM30 : na, "POC M30", colM30, 1, plot.style_circles)
 plot(useH1 ? pocH1 : na, "POC H1", colH1, 2, plot.style_circles)
 plot(useH4 ? pocH4 : na, "POC H4", colH4, 2, plot.style_circles)
+plot(useD ? pocD : na, "POC D", colD, 2, plot.style_circles)
+plot(useW ? pocW : na, "POC S", colW, 2, plot.style_circles)
+plot(useMN ? pocMN : na, "POC M", colMN, 2, plot.style_circles)
+plot(useY ? pocY : na, "POC 12M", colY, 2, plot.style_circles)
 
 // Una etiqueta persistente por temporalidad, reposicionada en la ultima vela.
 lblSize = labelSize == "small" ? size.small : labelSize == "normal" ? size.normal : size.tiny
@@ -303,8 +328,10 @@ if barstate.islast
 updatePocLabel(enabled, price, name, col) =>
     if barstate.islast and showPocLabels and enabled and not na(price)
         txt = showPocPrice ? name + " " + str.tostring(price, format.mintick) : name
+        // La punta de la linea es la ultima vela: la etiqueta arranca ahi hacia la derecha.
         array.push(pocLabels, label.new(bar_index + labelOffset, price, txt, xloc.bar_index,
-             yloc.price, color.new(color.black, 100), label.style_label_left, col, lblSize))
+             yloc.price, color.new(color.black, 100), label.style_label_left, col, lblSize,
+             text_align = text.align_left))
 
 updatePocLabel(useM1, pocM1, "M1", colM1)
 updatePocLabel(useM5, pocM5, "M5", colM5)
@@ -312,6 +339,10 @@ updatePocLabel(useM15, pocM15, "M15", colM15)
 updatePocLabel(useM30, pocM30, "M30", colM30)
 updatePocLabel(useH1, pocH1, "H1", colH1)
 updatePocLabel(useH4, pocH4, "H4", colH4)
+updatePocLabel(useD, pocD, "D", colD)
+updatePocLabel(useW, pocW, "S", colW)
+updatePocLabel(useMN, pocMN, "M", colMN)
+updatePocLabel(useY, pocY, "12M", colY)
 
 pLow = plot(clusterLow, "Cluster low", color.new(color.teal, 60))
 pHigh = plot(clusterHigh, "Cluster high", color.new(color.teal, 60))

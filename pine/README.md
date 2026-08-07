@@ -4,7 +4,7 @@ Indicador en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView. No e
 
 ## Logica
 
-1. **POC por temporalidad**: perfil de volumen sobre las ultimas `profileBars` velas de M1, M5, M15, M30, H1 y H4. El volumen de cada vela se reparte proporcionalmente entre las filas del perfil que atraviesa; el POC es el centro de la fila con mas volumen.
+1. **POC por temporalidad**: perfil de volumen sobre las ultimas `profileBars` velas de M1, M5, M15, M30, H1, H4 y, opcionalmente, D, S (semanal), M (mensual) y 12M (anual; desactivadas por defecto). El volumen de cada vela se reparte proporcionalmente entre las filas del perfil que atraviesa; el POC es el centro de la fila con mas volumen.
 2. **Cluster**: se busca el subconjunto mas numeroso de POC cuyo rango no exceda la tolerancia (puntos fijos o `ATR(14) x factor`). Requiere al menos `minPocsInCluster` POC.
 3. **Correcciones (pullbacks)**: con pivotes (`ta.pivothigh`/`ta.pivotlow`) se mide la pierna de impulso; si supera `impulseAtrMult x ATR`, se marca el **inicio de la correccion** en la primera vela que rompe la minima (correccion bajista) o la maxima (correccion alcista) anterior. Ese inicio emite una alerta informativa (`event=correction_start`) y no opera.
 4. **Senales** (`entryMode = Pullback`, por defecto): no se senalizan los rallys. Se genera senal cuando la correccion retrocede entre `minRetrace` y `maxRetrace` % del impulso, toca la zona del cluster y el precio reanuda cerrando al otro lado del cluster. Con `entryMode = Rotura directa` se opera el cruce del cluster sin exigir correccion.
@@ -21,7 +21,7 @@ Indicador en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView. No e
 
 ## Visualizacion
 
-Cada POC se dibuja con su color y lleva una etiqueta con el nombre de la temporalidad (M1, M5, M15, M30, H1, H4) y, opcionalmente, el precio. Se controla en el grupo *Visualizacion*: `showPocLabels`, `showPocPrice`, `labelOffset` (velas a la derecha) y `labelSize`. La zona del cluster se sombrea y el fondo se tinta mientras hay una correccion en curso.
+Cada POC se dibuja con su color y lleva una etiqueta al final de la punta derecha de su linea (ultima vela) con el nombre de la temporalidad (M1, M5, M15, M30, H1, H4, D, S, M, 12M) y, opcionalmente, el precio. Se controla en el grupo *Visualizacion*: `showPocLabels`, `showPocPrice`, `labelOffset` (0 = pegada a la linea) y `labelSize`. La zona del cluster se sombrea y el fondo se tinta mientras hay una correccion en curso.
 
 ## Alertas → MetaTrader 5 (Swissquote)
 
