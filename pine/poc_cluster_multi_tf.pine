@@ -321,8 +321,10 @@ plot(useY ? pocY : na, "POC 12M", colY, 2, plot.style_circles)
 lblSize = labelSize == "small" ? size.small : labelSize == "normal" ? size.normal : size.tiny
 var array<label> pocLabels = array.new<label>()
 if barstate.islast
-    for i = 0 to array.size(pocLabels) - 1
-        label.delete(array.get(pocLabels, i))
+    // `for ... to` cuenta hacia atras si el limite es menor que el inicio, asi que
+    // con el array vacio un `0 to size - 1` accederia al indice 0 inexistente.
+    for lbl in pocLabels
+        label.delete(lbl)
     array.clear(pocLabels)
 
 updatePocLabel(enabled, price, name, col) =>
