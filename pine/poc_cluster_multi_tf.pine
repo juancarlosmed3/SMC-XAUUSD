@@ -332,8 +332,7 @@ updatePocLabel(enabled, price, name, col) =>
         txt = showPocPrice ? name + " " + str.tostring(price, format.mintick) : name
         // La punta de la linea es la ultima vela: la etiqueta arranca ahi hacia la derecha.
         array.push(pocLabels, label.new(bar_index + labelOffset, price, txt, xloc.bar_index,
-             yloc.price, color.new(color.black, 100), label.style_label_left, col, lblSize,
-             text_align = text.align_left))
+             yloc.price, color.new(color.black, 100), label.style_label_left, col, lblSize))
 
 updatePocLabel(useM1, pocM1, "M1", colM1)
 updatePocLabel(useM5, pocM5, "M5", colM5)
