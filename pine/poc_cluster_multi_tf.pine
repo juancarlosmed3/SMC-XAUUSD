@@ -11,10 +11,9 @@
 //      direccion de la tendencia (o, opcionalmente, por rotura directa del cluster).
 //   5. Filtros: direccion de tendencia con SMA 200 y fuerza con volumen relativo.
 //   6. Emite alertas JSON listas para un puente/webhook hacia MetaTrader 5.
-strategy("POC Cluster Multi-TF (XAUUSD/XAGUSD)", overlay = true, calc_on_every_tick = false,
-     default_qty_type = strategy.percent_of_equity, default_qty_value = 5,
-     initial_capital = 10000, currency = currency.USD, pyramiding = 0,
-     commission_type = strategy.commission.percent, commission_value = 0.01)
+// Es un indicador: no ejecuta ordenes ni hace backtest; la ejecucion la realiza
+// el puente en `bridge/` a partir de las alertas.
+indicator("POC Cluster Multi-TF (XAUUSD/XAGUSD)", shorttitle = "POC Cluster MTF", overlay = true, max_bars_back = 1000)
 
 // ---------------------------------------------------------------- Inputs
 grpProfile = "Perfil de volumen / POC"
@@ -224,22 +223,17 @@ if longSignal
 if shortSignal
     inPullUp := false
 
-// ---------------------------------------------------------------- Ordenes
-if longSignal
-    strategy.entry("Long", strategy.long)
-if shortSignal
-    strategy.entry("Short", strategy.short)
-
-if useStops and not na(atr)
-    strategy.exit("Long SL/TP", from_entry = "Long", stop = strategy.position_avg_price - atr * slAtrMult,
-         limit = strategy.position_avg_price + atr * tpAtrMult)
-    strategy.exit("Short SL/TP", from_entry = "Short", stop = strategy.position_avg_price + atr * slAtrMult,
-         limit = strategy.position_avg_price - atr * tpAtrMult)
+// ---------------------------------------------------------------- Niveles SL/TP
+// Solo informativos y para el payload de la alerta (el indicador no opera).
+longSl = close - atr * slAtrMult
+longTp = close + atr * tpAtrMult
+shortSl = close + atr * slAtrMult
+shortTp = close - atr * tpAtrMult
 
 // ---------------------------------------------------------------- Alertas (JSON para puente MT5)
 mt5Payload(side) =>
-    sl = side == "BUY" ? close - atr * slAtrMult : close + atr * slAtrMult
-    tp = side == "BUY" ? close + atr * tpAtrMult : close - atr * tpAtrMult
+    sl = side == "BUY" ? longSl : shortSl
+    tp = side == "BUY" ? longTp : shortTp
     '{"broker":"swissquote","action":"' + side + '","symbol":"' + syminfo.ticker + '"' +
      ',"lots":' + str.tostring(lots) +
      ',"price":' + str.tostring(close, format.mintick) +

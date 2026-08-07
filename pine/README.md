@@ -1,22 +1,23 @@
 # POC Cluster Multi-TF (XAUUSD / XAGUSD)
 
-Estrategia en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView.
+Indicador en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView. No ejecuta ordenes ni hace backtest: pinta niveles, marca senales y emite alertas; la ejecucion la hace el puente de `bridge/`.
 
 ## Logica
 
 1. **POC por temporalidad**: perfil de volumen sobre las ultimas `profileBars` velas de M1, M5, M15, M30, H1 y H4. El volumen de cada vela se reparte proporcionalmente entre las filas del perfil que atraviesa; el POC es el centro de la fila con mas volumen.
 2. **Cluster**: se busca el subconjunto mas numeroso de POC cuyo rango no exceda la tolerancia (puntos fijos o `ATR(14) x factor`). Requiere al menos `minPocsInCluster` POC.
 3. **Correcciones (pullbacks)**: con pivotes (`ta.pivothigh`/`ta.pivotlow`) se mide la pierna de impulso; si supera `impulseAtrMult x ATR`, se marca el **inicio de la correccion** en la primera vela que rompe la minima (correccion bajista) o la maxima (correccion alcista) anterior. Ese inicio emite una alerta informativa (`event=correction_start`) y no opera.
-4. **Entradas** (`entryMode = Pullback`, por defecto): no se operan los rallys. Se entra cuando la correccion retrocede entre `minRetrace` y `maxRetrace` % del impulso, toca la zona del cluster y el precio reanuda cerrando al otro lado del cluster. Con `entryMode = Rotura directa` se opera el cruce del cluster sin exigir correccion.
+4. **Senales** (`entryMode = Pullback`, por defecto): no se senalizan los rallys. Se genera senal cuando la correccion retrocede entre `minRetrace` y `maxRetrace` % del impulso, toca la zona del cluster y el precio reanuda cerrando al otro lado del cluster. Con `entryMode = Rotura directa` se opera el cruce del cluster sin exigir correccion.
 5. **Filtros**: SMA 200 define la direccion (solo BUY sobre la SMA, solo SELL debajo) y el volumen debe superar `volMult x` su media de `volLen` velas.
-6. **SL/TP**: multiplos de ATR, configurables.
+6. **SL/TP**: niveles informativos por multiplos de ATR, incluidos en el payload de la alerta.
 
 ## Uso
 
 1. TradingView → Pine Editor → pegar el contenido de `poc_cluster_multi_tf.pine` → *Add to chart*.
 2. Recomendado ejecutarlo en M5 o M15 (el TF del grafico solo define cuando se evalua la rotura).
-3. Ajustar tolerancia del cluster segun el activo: XAUUSD ≈ 2.0 USD, XAGUSD ≈ 0.05 USD.
-4. Requiere plan de TradingView con acceso a datos intradia del broker/feed correspondiente.
+3. Crear la alerta con condicion *"POC Cluster Multi-TF" → Any alert() function call*.
+4. Ajustar tolerancia del cluster segun el activo: XAUUSD ≈ 2.0 USD, XAGUSD ≈ 0.05 USD.
+5. Requiere plan de TradingView con acceso a datos intradia del broker/feed correspondiente.
 
 ## Alertas → MetaTrader 5 (Swissquote)
 
