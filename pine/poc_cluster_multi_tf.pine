@@ -1,0 +1,211 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//@version=5
+// POC Cluster Multi-Timeframe (M1/M5/M15/M30/H1/H4) para XAUUSD / XAGUSD (CFD)
+// Logica:
+//   1. Calcula el POC (Point of Control, precio con mayor volumen) por cada temporalidad
+//      usando un perfil de volumen sobre las ultimas `profileBars` velas de cada TF.
+//   2. Detecta "cluster": todos los POC dentro de un rango <= clusterTolerance.
+//   3. Compra cuando el precio cierra por encima del cluster (rotura al alza),
+//      vende cuando cierra por debajo.
+//   4. Filtros: direccion de tendencia con SMA 200 y fuerza con volumen relativo.
+//   5. Emite alertas JSON listas para un puente/webhook hacia MetaTrader 5.
+strategy("POC Cluster Multi-TF (XAUUSD/XAGUSD)", overlay = true, calc_on_every_tick = false,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 5,
+     initial_capital = 10000, currency = currency.USD, pyramiding = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.01)
+
+// ---------------------------------------------------------------- Inputs
+grpProfile = "Perfil de volumen / POC"
+profileBars      = input.int(200, "Velas por perfil", minval = 20, maxval = 1000, group = grpProfile)
+profileRows      = input.int(50, "Filas del perfil (resolucion)", minval = 10, maxval = 200, group = grpProfile)
+useM1            = input.bool(true, "M1", inline = "tf1", group = grpProfile)
+useM5            = input.bool(true, "M5", inline = "tf1", group = grpProfile)
+useM15           = input.bool(true, "M15", inline = "tf1", group = grpProfile)
+useM30           = input.bool(true, "M30", inline = "tf2", group = grpProfile)
+useH1            = input.bool(true, "H1", inline = "tf2", group = grpProfile)
+useH4            = input.bool(true, "H4", inline = "tf2", group = grpProfile)
+
+grpCluster = "Cluster"
+clusterMode      = input.string("Puntos", "Modo de tolerancia", options = ["Puntos", "ATR"], group = grpCluster)
+clusterPoints    = input.float(2.0, "Tolerancia en puntos de precio", minval = 0.0, step = 0.1, group = grpCluster,
+     tooltip = "XAUUSD: ~2.0 USD. XAGUSD: ~0.05 USD.")
+clusterAtrMult   = input.float(0.5, "Tolerancia = ATR(14) x", minval = 0.05, step = 0.05, group = grpCluster)
+minPocsInCluster = input.int(4, "Minimo de POC en cluster", minval = 2, maxval = 6, group = grpCluster)
+breakoutBuffer   = input.float(0.0, "Buffer de rotura (puntos)", minval = 0.0, step = 0.1, group = grpCluster)
+
+grpFilters = "Filtros"
+smaLen           = input.int(200, "Longitud SMA de tendencia", minval = 10, group = grpFilters)
+useSmaFilter     = input.bool(true, "Filtrar por SMA", group = grpFilters)
+useVolFilter     = input.bool(true, "Filtrar por volumen", group = grpFilters)
+volLen           = input.int(20, "Media de volumen", minval = 2, group = grpFilters)
+volMult          = input.float(1.5, "Volumen minimo x media", minval = 0.1, step = 0.1, group = grpFilters)
+
+grpRisk = "Gestion de riesgo"
+useStops         = input.bool(true, "Usar SL/TP por ATR", group = grpRisk)
+atrLen           = input.int(14, "ATR", minval = 2, group = grpRisk)
+slAtrMult        = input.float(1.5, "SL = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+tpAtrMult        = input.float(3.0, "TP = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+lots             = input.float(0.10, "Lotes para MT5 (alerta)", minval = 0.01, step = 0.01, group = grpRisk)
+
+// ---------------------------------------------------------------- POC helper
+// POC de la temporalidad actual: perfil de volumen de `profileBars` velas.
+// Una sola pasada por las velas: reparte el volumen de cada vela entre las filas
+// que atraviesa y devuelve el centro de la fila con mas volumen.
+pocCurrent() =>
+    hi = ta.highest(high, profileBars)
+    lo = ta.lowest(low, profileBars)
+    rng = hi - lo
+    float poc = na
+    if not na(rng) and rng > 0
+        step = rng / profileRows
+        bins = array.new<float>(profileRows, 0.0)
+        for i = 0 to profileBars - 1
+            bh = high[i]
+            bl = low[i]
+            v = nz(volume[i])
+            if v > 0
+                firstRow = math.max(0, math.min(profileRows - 1, int((bl - lo) / step)))
+                lastRow = math.max(0, math.min(profileRows - 1, int((bh - lo) / step)))
+                barRange = math.max(bh - bl, step)
+                for row = firstRow to lastRow
+                    rowLo = lo + step * row
+                    overlap = math.min(bh, rowLo + step) - math.max(bl, rowLo)
+                    if overlap > 0
+                        array.set(bins, row, array.get(bins, row) + v * (overlap / barRange))
+        best = array.indexof(bins, array.max(bins))
+        poc := lo + step * (best + 0.5)
+    poc
+
+// Cada llamada a request.security ejecuta pocCurrent() en su propia temporalidad.
+pocOf(tf) => request.security(syminfo.tickerid, tf, pocCurrent(), lookahead = barmerge.lookahead_off)
+
+pocM1  = pocOf("1")
+pocM5  = pocOf("5")
+pocM15 = pocOf("15")
+pocM30 = pocOf("30")
+pocH1  = pocOf("60")
+pocH4  = pocOf("240")
+
+// ---------------------------------------------------------------- Cluster
+atr = ta.atr(atrLen)
+tolerance = clusterMode == "ATR" ? atr * clusterAtrMult : clusterPoints
+
+var array<float> pocs = array.new<float>()
+array.clear(pocs)
+if useM1 and not na(pocM1)
+    array.push(pocs, pocM1)
+if useM5 and not na(pocM5)
+    array.push(pocs, pocM5)
+if useM15 and not na(pocM15)
+    array.push(pocs, pocM15)
+if useM30 and not na(pocM30)
+    array.push(pocs, pocM30)
+if useH1 and not na(pocH1)
+    array.push(pocs, pocH1)
+if useH4 and not na(pocH4)
+    array.push(pocs, pocH4)
+
+// Subconjunto mas denso: la ventana de POC ordenados con menor dispersion.
+float clusterLow = na
+float clusterHigh = na
+int clusterCount = 0
+if array.size(pocs) >= minPocsInCluster
+    sorted = array.copy(pocs)
+    array.sort(sorted, order.ascending)
+    n = array.size(sorted)
+    float bestSpread = na
+    for start = 0 to n - minPocsInCluster
+        endIdx = start + minPocsInCluster - 1
+        // extiende la ventana mientras siga dentro de la tolerancia
+        int last = endIdx
+        while last + 1 < n and array.get(sorted, last + 1) - array.get(sorted, start) <= tolerance
+            last += 1
+        spread = array.get(sorted, last) - array.get(sorted, start)
+        size = last - start + 1
+        if spread <= tolerance and (size > clusterCount or (size == clusterCount and (na(bestSpread) or spread < bestSpread)))
+            clusterCount := size
+            bestSpread := spread
+            clusterLow := array.get(sorted, start)
+            clusterHigh := array.get(sorted, last)
+
+hasCluster = clusterCount >= minPocsInCluster
+clusterMid = hasCluster ? (clusterLow + clusterHigh) / 2 : na
+
+// ---------------------------------------------------------------- Filtros
+sma = ta.sma(close, smaLen)
+volAvg = ta.sma(volume, volLen)
+volOk = not useVolFilter or (not na(volAvg) and volume >= volAvg * volMult)
+trendUp = not useSmaFilter or (not na(sma) and close > sma)
+trendDown = not useSmaFilter or (not na(sma) and close < sma)
+
+aboveCluster = hasCluster and close > clusterHigh + breakoutBuffer
+belowCluster = hasCluster and close < clusterLow - breakoutBuffer
+crossUp = aboveCluster and not (hasCluster[1] and close[1] > clusterHigh[1] + breakoutBuffer)
+crossDown = belowCluster and not (hasCluster[1] and close[1] < clusterLow[1] - breakoutBuffer)
+
+longSignal = crossUp and trendUp and volOk
+shortSignal = crossDown and trendDown and volOk
+
+// ---------------------------------------------------------------- Ordenes
+if longSignal
+    strategy.entry("Long", strategy.long)
+if shortSignal
+    strategy.entry("Short", strategy.short)
+
+if useStops and not na(atr)
+    strategy.exit("Long SL/TP", from_entry = "Long", stop = strategy.position_avg_price - atr * slAtrMult,
+         limit = strategy.position_avg_price + atr * tpAtrMult)
+    strategy.exit("Short SL/TP", from_entry = "Short", stop = strategy.position_avg_price + atr * slAtrMult,
+         limit = strategy.position_avg_price - atr * tpAtrMult)
+
+// ---------------------------------------------------------------- Alertas (JSON para puente MT5)
+mt5Payload(side) =>
+    sl = side == "BUY" ? close - atr * slAtrMult : close + atr * slAtrMult
+    tp = side == "BUY" ? close + atr * tpAtrMult : close - atr * tpAtrMult
+    '{"broker":"swissquote","action":"' + side + '","symbol":"' + syminfo.ticker + '"' +
+     ',"lots":' + str.tostring(lots) +
+     ',"price":' + str.tostring(close, format.mintick) +
+     ',"sl":' + str.tostring(useStops ? sl : na, format.mintick) +
+     ',"tp":' + str.tostring(useStops ? tp : na, format.mintick) +
+     ',"poc_cluster_low":' + str.tostring(clusterLow, format.mintick) +
+     ',"poc_cluster_high":' + str.tostring(clusterHigh, format.mintick) +
+     ',"poc_count":' + str.tostring(clusterCount) +
+     ',"sma' + str.tostring(smaLen) + '":' + str.tostring(sma, format.mintick) +
+     ',"volume":' + str.tostring(volume) +
+     ',"volume_avg":' + str.tostring(volAvg) +
+     ',"tf":"' + timeframe.period + '"' +
+     ',"time":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"}'
+
+if longSignal
+    alert(mt5Payload("BUY"), alert.freq_once_per_bar_close)
+if shortSignal
+    alert(mt5Payload("SELL"), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------- Visualizacion
+plot(sma, "SMA tendencia", color.new(color.orange, 0), 2)
+plot(useM1 ? pocM1 : na, "POC M1", color.new(color.gray, 40), 1, plot.style_circles)
+plot(useM5 ? pocM5 : na, "POC M5", color.new(color.aqua, 30), 1, plot.style_circles)
+plot(useM15 ? pocM15 : na, "POC M15", color.new(color.blue, 30), 1, plot.style_circles)
+plot(useM30 ? pocM30 : na, "POC M30", color.new(color.purple, 30), 1, plot.style_circles)
+plot(useH1 ? pocH1 : na, "POC H1", color.new(color.fuchsia, 20), 2, plot.style_circles)
+plot(useH4 ? pocH4 : na, "POC H4", color.new(color.red, 10), 2, plot.style_circles)
+
+pLow = plot(clusterLow, "Cluster low", color.new(color.teal, 60))
+pHigh = plot(clusterHigh, "Cluster high", color.new(color.teal, 60))
+fill(pLow, pHigh, color = hasCluster ? color.new(color.teal, 80) : na, title = "Zona de cluster")
+
+plotshape(longSignal, "BUY", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(shortSignal, "SELL", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+
+var table info = table.new(position.top_right, 2, 5, border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "POC en cluster", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 0, str.tostring(clusterCount) + " / " + str.tostring(array.size(pocs)))
+    table.cell(info, 0, 1, "Zona cluster", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 1, hasCluster ? str.tostring(clusterLow, format.mintick) + " - " + str.tostring(clusterHigh, format.mintick) : "sin cluster")
+    table.cell(info, 0, 2, "Tolerancia", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 2, str.tostring(tolerance, format.mintick))
+    table.cell(info, 0, 3, "Tendencia SMA", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 3, na(sma) ? "n/d" : close > sma ? "alcista" : "bajista")
+    table.cell(info, 0, 4, "Volumen vs media", bgcolor = color.new(color.gray, 80))
+    table.cell(info, 1, 4, na(volAvg) or volAvg == 0 ? "n/d" : str.tostring(volume / volAvg, "#.##") + "x")
