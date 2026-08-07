@@ -102,6 +102,8 @@ class LiquidityFilters:
     min_volume: int = 10
     max_spread_pct: float = 0.12
     min_premium: float = 0.20
+    # 0 disables the cap; use it to bound the cash cost per contract.
+    max_premium: float = 0.0
 
 
 @dataclass
@@ -192,6 +194,8 @@ def _evaluate_chain(
         side, strike, iv = quote.side, quote.strike, quote.iv
 
         if mid < liquidity.min_premium or spread_pct > liquidity.max_spread_pct:
+            continue
+        if liquidity.max_premium > 0.0 and mid > liquidity.max_premium:
             continue
         if quote.open_interest < liquidity.min_open_interest or quote.volume < liquidity.min_volume:
             continue
@@ -392,6 +396,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-volume", type=int, default=LiquidityFilters.min_volume)
     parser.add_argument("--max-spread-pct", type=float, default=LiquidityFilters.max_spread_pct)
     parser.add_argument(
+        "--min-premium",
+        type=float,
+        default=LiquidityFilters.min_premium,
+        help="Skip contracts cheaper than this mid price",
+    )
+    parser.add_argument(
+        "--max-premium",
+        type=float,
+        default=LiquidityFilters.max_premium,
+        help="Cap the mid price per share, e.g. 3.0 for contracts costing at most $300 (0 = no cap)",
+    )
+    parser.add_argument(
         "--json-out",
         help="Also write the reported setups to this JSON path (same rows as the table)",
     )
@@ -417,6 +433,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         min_open_interest=args.min_open_interest,
         min_volume=args.min_volume,
         max_spread_pct=args.max_spread_pct,
+        min_premium=args.min_premium,
+        max_premium=args.max_premium,
     )
 
     if args.source == "ibkr":

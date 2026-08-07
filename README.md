@@ -51,6 +51,11 @@ Liquidity filters (open interest, volume, bid/ask spread, minimum premium) run
 before the greeks so the ranked contracts are actually fillable. Every band is
 overridable from the CLI (`--min-abs-delta`, `--max-theta-burn`, ...).
 
+`--max-premium` caps the cash cost per contract (`--max-premium 6` means at most
+$600). Expect the scores to drop as you lower it: a cheap contract is cheap
+because it is further out of the money or closer to expiry, so its delta drifts
+toward the edge of the band and its decay is a larger percentage of the premium.
+
 The score (0–100) weights delta centering 30%, gamma/theta 30%, theta burn 25%
 and vega 15%. Contracts are quoted in thinkorswim symbol format (`.SPY260918P777`)
 so they paste straight into the platform.

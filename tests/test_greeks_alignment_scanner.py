@@ -114,6 +114,25 @@ def test_reported_setups_applies_aligned_only_and_top():
     assert len(reported_setups(setups, top_n=1, aligned_only=True)) == 1
 
 
+def test_max_premium_caps_contract_cost_and_zero_disables_the_cap():
+    quotes = [
+        ContractQuote("call", 100.0, 4.9, 5.1, 5000, 400, 0.25, "CHEAP"),
+        ContractQuote("call", 90.0, 12.0, 12.4, 5000, 400, 0.25, "PRICEY"),
+    ]
+    kwargs = dict(
+        spot=100.0,
+        expiration="2026-03-02",
+        dte=29,
+        rate=0.0,
+        dividend_yield=0.0,
+        thresholds=AlignmentThresholds(),
+    )
+    capped = _evaluate_chain("FAKE", quotes, liquidity=LiquidityFilters(max_premium=6.0), **kwargs)
+    uncapped = _evaluate_chain("FAKE", quotes, liquidity=LiquidityFilters(), **kwargs)
+    assert [s.contract_symbol for s in capped] == ["CHEAP"]
+    assert [s.contract_symbol for s in uncapped] == ["CHEAP", "PRICEY"]
+
+
 def test_tos_symbol_format():
     assert _tos_symbol("SPY", "2026-09-18", "call", 777.0) == ".SPY260918C777"
     assert _tos_symbol("AAPL", "2026-09-18", "put", 315.5) == ".AAPL260918P315.5"
