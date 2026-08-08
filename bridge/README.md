@@ -8,6 +8,10 @@ Servicio FastAPI que recibe las alertas de la estrategia Pine (`pine/poc_cluster
 - En MT5: *Herramientas → Opciones → Asesores expertos* → permitir *Algo Trading*.
 - Python 3.10+.
 
+## Ubicación en el PC de trading
+
+El proyecto vive en `C:\Users\juanc\Documents\Ruah Commodities\RNT\Red Cluster POC`. Clona/copia el repo ahí y ejecuta `bridge\run_windows.bat`: crea el venv, instala dependencias, carga `bridge\.env` y levanta uvicorn en el puerto 8000. La ruta tiene espacios, así que si lanzas comandos a mano entrecomíllala.
+
 ## Instalación
 
 ```powershell
