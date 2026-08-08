@@ -21,7 +21,7 @@ Indicador en Pine Script v6 (`poc_cluster_multi_tf.pine`) para TradingView. No e
 
 ## Visualizacion
 
-Cada POC se dibuja con su color y lleva una etiqueta al final de la punta derecha de su linea (ultima vela) con el nombre de la temporalidad (M1, M5, M15, M30, H1, H4, D, S, M, 12M) y, opcionalmente, el precio. Se controla en el grupo *Visualizacion*: `showPocLabels`, `showPocPrice`, `labelOffset` (0 = pegada a la linea) y `labelSize`. La zona del cluster se sombrea y el fondo se tinta mientras hay una correccion en curso.
+Cada POC se dibuja con su color y lleva, al final de la punta derecha de su linea, una etiqueta con solo el nombre de la temporalidad (M1, M5, M15, M30, H1, H4, D, S, M, 12M); los POC usan `display.pane`, asi que no aparecen en la escala de precios. Se controla en el grupo *Visualizacion*: `showPocLabels`, `labelOffset` (0 = pegada a la linea), `labelSize` y `tableTextTransp` (transparencia del texto del tablero, maximo 70%). La zona del cluster se sombrea y el fondo se tinta mientras hay una correccion en curso.
 
 ## Alertas → MetaTrader 5 (Swissquote)
 
