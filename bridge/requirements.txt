@@ -1,0 +1,5 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.11.4
+# Solo Windows: el terminal MT5 es una app de Windows.
+MetaTrader5==5.0.4993; sys_platform == "win32"

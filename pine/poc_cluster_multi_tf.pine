@@ -1,0 +1,381 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+// POC Cluster Multi-Timeframe (M1..H4 + D/S/M/12M) para XAUUSD / XAGUSD (CFD)
+// Logica:
+//   1. Calcula el POC (Point of Control, precio con mayor volumen) por cada temporalidad
+//      usando un perfil de volumen sobre las ultimas `profileBars` velas de cada TF.
+//   2. Detecta "cluster": todos los POC dentro de un rango <= clusterTolerance.
+//   3. Detecta el INICIO de correcciones (pullbacks) tras un impulso: no se operan
+//      los rallys, sino la correccion institucional y su reanudacion.
+//   4. Entra cuando la correccion alcanza el cluster de POC y el precio reanuda la
+//      direccion de la tendencia (o, opcionalmente, por rotura directa del cluster).
+//   5. Filtros: direccion de tendencia con SMA 200 y fuerza con volumen relativo.
+//   6. Emite alertas JSON listas para un puente/webhook hacia MetaTrader 5.
+// Es un indicador: no ejecuta ordenes ni hace backtest; la ejecucion la realiza
+// el puente en `bridge/` a partir de las alertas.
+indicator("POC Cluster Multi-TF (XAUUSD/XAGUSD)", shorttitle = "POC Cluster MTF", overlay = true, max_bars_back = 1000)
+
+// ---------------------------------------------------------------- Inputs
+grpProfile = "Perfil de volumen / POC"
+profileBars      = input.int(200, "Velas por perfil", minval = 20, maxval = 1000, group = grpProfile)
+profileRows      = input.int(50, "Filas del perfil (resolucion)", minval = 10, maxval = 200, group = grpProfile)
+useM1            = input.bool(true, "M1", inline = "tf1", group = grpProfile)
+useM5            = input.bool(true, "M5", inline = "tf1", group = grpProfile)
+useM15           = input.bool(true, "M15", inline = "tf1", group = grpProfile)
+useM30           = input.bool(true, "M30", inline = "tf2", group = grpProfile)
+useH1            = input.bool(true, "H1", inline = "tf2", group = grpProfile)
+useH4            = input.bool(true, "H4", inline = "tf2", group = grpProfile)
+useD             = input.bool(false, "D", inline = "tf3", group = grpProfile)
+useW             = input.bool(false, "S", inline = "tf3", group = grpProfile)
+useMN            = input.bool(false, "M", inline = "tf3", group = grpProfile)
+useY             = input.bool(false, "12M", inline = "tf3", group = grpProfile)
+
+grpCluster = "Cluster"
+clusterMode      = input.string("Puntos", "Modo de tolerancia", options = ["Puntos", "ATR"], group = grpCluster)
+clusterPoints    = input.float(2.0, "Tolerancia en puntos de precio", minval = 0.0, step = 0.1, group = grpCluster,
+     tooltip = "XAUUSD: ~2.0 USD. XAGUSD: ~0.05 USD.")
+clusterAtrMult   = input.float(0.5, "Tolerancia = ATR(14) x", minval = 0.05, step = 0.05, group = grpCluster)
+minPocsInCluster = input.int(4, "Minimo de POC en cluster", minval = 2, maxval = 10, group = grpCluster)
+breakoutBuffer   = input.float(0.0, "Buffer de rotura (puntos)", minval = 0.0, step = 0.1, group = grpCluster)
+
+grpFilters = "Filtros"
+smaLen           = input.int(200, "Longitud SMA de tendencia", minval = 10, group = grpFilters)
+useSmaFilter     = input.bool(true, "Filtrar por SMA", group = grpFilters)
+useVolFilter     = input.bool(true, "Filtrar por volumen", group = grpFilters)
+volLen           = input.int(20, "Media de volumen", minval = 2, group = grpFilters)
+volMult          = input.float(1.5, "Volumen minimo x media", minval = 0.1, step = 0.1, group = grpFilters)
+
+grpView = "Visualizacion"
+showPocLabels    = input.bool(true, "Etiqueta con la temporalidad en cada POC", group = grpView)
+labelOffset      = input.int(0, "Desplazamiento extra de la etiqueta (velas)", minval = 0, maxval = 50, group = grpView,
+     tooltip = "0 = pegada al final de la linea del POC.")
+labelSize        = input.string("tiny", "Tamano de la etiqueta", options = ["tiny", "small", "normal"], group = grpView)
+tableTextTransp  = input.int(0, "Transparencia del texto del tablero (%)", minval = 0, maxval = 70, group = grpView)
+
+grpPull = "Correcciones (pullbacks)"
+entryMode        = input.string("Pullback", "Modo de entrada", options = ["Pullback", "Rotura directa"], group = grpPull,
+     tooltip = "Pullback: opera la reanudacion tras la correccion. Rotura directa: opera el cruce del cluster.")
+pivotLen         = input.int(5, "Velas del pivote de estructura", minval = 2, group = grpPull)
+impulseAtrMult   = input.float(2.0, "Impulso minimo = ATR x", minval = 0.1, step = 0.1, group = grpPull)
+minRetrace       = input.float(23.6, "Retroceso minimo del impulso (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = grpPull)
+maxRetrace       = input.float(78.6, "Retroceso maximo del impulso (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = grpPull)
+pullbackBars     = input.int(30, "Vigencia de la correccion (velas)", minval = 1, group = grpPull)
+requireClusterTouch = input.bool(true, "Exigir que la correccion toque el cluster", group = grpPull)
+
+grpRisk = "Gestion de riesgo"
+useStops         = input.bool(true, "Usar SL/TP por ATR", group = grpRisk)
+atrLen           = input.int(14, "ATR", minval = 2, group = grpRisk)
+slAtrMult        = input.float(1.5, "SL = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+tpAtrMult        = input.float(3.0, "TP = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+lots             = input.float(0.10, "Lotes para MT5 (alerta)", minval = 0.01, step = 0.01, group = grpRisk)
+
+// ---------------------------------------------------------------- POC helper
+// POC de la temporalidad actual: perfil de volumen de `profileBars` velas.
+// Una sola pasada por las velas: reparte el volumen de cada vela entre las filas
+// que atraviesa y devuelve el centro de la fila con mas volumen.
+// En D/S/M/12M puede haber menos velas que `profileBars`: se recorta a las
+// disponibles, si no `ta.highest` devuelve na y el POC no se dibuja.
+pocCurrent() =>
+    len = math.max(2, math.min(profileBars, bar_index + 1))
+    hi = ta.highest(high, len)
+    lo = ta.lowest(low, len)
+    rng = hi - lo
+    float poc = na
+    if not na(rng) and rng > 0
+        step = rng / profileRows
+        bins = array.new<float>(profileRows, 0.0)
+        for i = 0 to len - 1
+            bh = high[i]
+            bl = low[i]
+            v = nz(volume[i])
+            if v > 0
+                firstRow = math.max(0, math.min(profileRows - 1, int((bl - lo) / step)))
+                lastRow = math.max(0, math.min(profileRows - 1, int((bh - lo) / step)))
+                barRange = math.max(bh - bl, step)
+                for row = firstRow to lastRow
+                    rowLo = lo + step * row
+                    overlap = math.min(bh, rowLo + step) - math.max(bl, rowLo)
+                    if overlap > 0
+                        array.set(bins, row, array.get(bins, row) + v * (overlap / barRange))
+        best = array.indexof(bins, array.max(bins))
+        poc := lo + step * (best + 0.5)
+    poc
+
+// Cada llamada a request.security ejecuta pocCurrent() en su propia temporalidad.
+pocOf(tf) => request.security(syminfo.tickerid, tf, pocCurrent(), lookahead = barmerge.lookahead_off)
+
+pocM1  = pocOf("1")
+pocM5  = pocOf("5")
+pocM15 = pocOf("15")
+pocM30 = pocOf("30")
+pocH1  = pocOf("60")
+pocH4  = pocOf("240")
+pocD   = pocOf("1D")
+pocW   = pocOf("1W")
+pocMN  = pocOf("1M")
+pocY   = pocOf("12M")
+
+// ---------------------------------------------------------------- Cluster
+atr = ta.atr(atrLen)
+tolerance = clusterMode == "ATR" ? atr * clusterAtrMult : clusterPoints
+
+var array<float> pocs = array.new<float>()
+array.clear(pocs)
+if useM1 and not na(pocM1)
+    array.push(pocs, pocM1)
+if useM5 and not na(pocM5)
+    array.push(pocs, pocM5)
+if useM15 and not na(pocM15)
+    array.push(pocs, pocM15)
+if useM30 and not na(pocM30)
+    array.push(pocs, pocM30)
+if useH1 and not na(pocH1)
+    array.push(pocs, pocH1)
+if useH4 and not na(pocH4)
+    array.push(pocs, pocH4)
+if useD and not na(pocD)
+    array.push(pocs, pocD)
+if useW and not na(pocW)
+    array.push(pocs, pocW)
+if useMN and not na(pocMN)
+    array.push(pocs, pocMN)
+if useY and not na(pocY)
+    array.push(pocs, pocY)
+
+// Subconjunto mas denso: la ventana de POC ordenados con menor dispersion.
+float clusterLow = na
+float clusterHigh = na
+int clusterCount = 0
+if array.size(pocs) >= minPocsInCluster
+    sorted = array.copy(pocs)
+    array.sort(sorted, order.ascending)
+    n = array.size(sorted)
+    float bestSpread = na
+    for start = 0 to n - minPocsInCluster
+        endIdx = start + minPocsInCluster - 1
+        // extiende la ventana mientras siga dentro de la tolerancia
+        int last = endIdx
+        while last + 1 < n and array.get(sorted, last + 1) - array.get(sorted, start) <= tolerance
+            last += 1
+        spread = array.get(sorted, last) - array.get(sorted, start)
+        size = last - start + 1
+        if spread <= tolerance and (size > clusterCount or (size == clusterCount and (na(bestSpread) or spread < bestSpread)))
+            clusterCount := size
+            bestSpread := spread
+            clusterLow := array.get(sorted, start)
+            clusterHigh := array.get(sorted, last)
+
+hasCluster = clusterCount >= minPocsInCluster
+clusterMid = hasCluster ? (clusterLow + clusterHigh) / 2 : na
+
+// ---------------------------------------------------------------- Filtros
+sma = ta.sma(close, smaLen)
+volAvg = ta.sma(volume, volLen)
+volOk = not useVolFilter or (not na(volAvg) and volume >= volAvg * volMult)
+trendUp = not useSmaFilter or (not na(sma) and close > sma)
+trendDown = not useSmaFilter or (not na(sma) and close < sma)
+
+aboveCluster = hasCluster and close > clusterHigh + breakoutBuffer
+belowCluster = hasCluster and close < clusterLow - breakoutBuffer
+crossUp = aboveCluster and not (hasCluster[1] and close[1] > clusterHigh[1] + breakoutBuffer)
+crossDown = belowCluster and not (hasCluster[1] and close[1] < clusterLow[1] - breakoutBuffer)
+
+// ------------------------------------------------- Estructura e impulsos
+// Pivotes confirmados: definen el ultimo swing y por tanto la pierna de impulso.
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastPH = na
+var float lastPL = na
+var int lastPHBar = na
+var int lastPLBar = na
+if not na(ph)
+    lastPH := ph
+    lastPHBar := bar_index - pivotLen
+if not na(pl)
+    lastPL := pl
+    lastPLBar := bar_index - pivotLen
+
+legUp = not na(lastPH) and not na(lastPL) and lastPHBar > lastPLBar ? lastPH - lastPL : na   // impulso alcista terminado en lastPH
+legDown = not na(lastPH) and not na(lastPL) and lastPLBar > lastPHBar ? lastPH - lastPL : na // impulso bajista terminado en lastPL
+impulseUp = not na(legUp) and legUp >= atr * impulseAtrMult
+impulseDown = not na(legDown) and legDown >= atr * impulseAtrMult
+
+// Inicio de la correccion: primera vela que rompe la minima/maxima anterior
+// despues de un impulso confirmado (correccion a la baja tras rally alcista y viceversa).
+var bool inPullDown = false
+var bool inPullUp = false
+var int pullBar = na
+var bool touchedCluster = false
+
+corrDownStart = impulseUp and not inPullDown and close < low[1] and high[1] <= lastPH
+corrUpStart = impulseDown and not inPullUp and close > high[1] and low[1] >= lastPL
+
+if corrDownStart
+    inPullDown := true
+    inPullUp := false
+    pullBar := bar_index
+    touchedCluster := false
+if corrUpStart
+    inPullUp := true
+    inPullDown := false
+    pullBar := bar_index
+    touchedCluster := false
+
+// Profundidad del retroceso respecto a la pierna de impulso.
+retraceDown = inPullDown and not na(legUp) and legUp > 0 ? (lastPH - low) / legUp * 100 : na
+retraceUp = inPullUp and not na(legDown) and legDown > 0 ? (high - lastPL) / legDown * 100 : na
+
+if (inPullDown or inPullUp) and hasCluster and low <= clusterHigh and high >= clusterLow
+    touchedCluster := true
+
+expired = not na(pullBar) and bar_index - pullBar > pullbackBars
+if expired
+    inPullDown := false
+    inPullUp := false
+
+depthOk(r) => not na(r) and r >= minRetrace and r <= maxRetrace
+clusterOk = not requireClusterTouch or touchedCluster
+
+// Reanudacion: la correccion termina cuando el precio vuelve a favor de la tendencia
+// cerrando al otro lado del cluster.
+resumeLong = inPullDown and depthOk(retraceDown) and clusterOk and crossUp
+resumeShort = inPullUp and depthOk(retraceUp) and clusterOk and crossDown
+
+longSignal = (entryMode == "Pullback" ? resumeLong : crossUp) and trendUp and volOk
+shortSignal = (entryMode == "Pullback" ? resumeShort : crossDown) and trendDown and volOk
+
+if longSignal
+    inPullDown := false
+if shortSignal
+    inPullUp := false
+
+// ---------------------------------------------------------------- Niveles SL/TP
+// Solo informativos y para el payload de la alerta (el indicador no opera).
+longSl = close - atr * slAtrMult
+longTp = close + atr * tpAtrMult
+shortSl = close + atr * slAtrMult
+shortTp = close - atr * tpAtrMult
+
+// ---------------------------------------------------------------- Alertas (JSON para puente MT5)
+mt5Payload(side) =>
+    sl = side == "BUY" ? longSl : shortSl
+    tp = side == "BUY" ? longTp : shortTp
+    '{"broker":"swissquote","action":"' + side + '","symbol":"' + syminfo.ticker + '"' +
+     ',"lots":' + str.tostring(lots) +
+     ',"price":' + str.tostring(close, format.mintick) +
+     ',"sl":' + str.tostring(useStops ? sl : na, format.mintick) +
+     ',"tp":' + str.tostring(useStops ? tp : na, format.mintick) +
+     ',"poc_cluster_low":' + str.tostring(clusterLow, format.mintick) +
+     ',"poc_cluster_high":' + str.tostring(clusterHigh, format.mintick) +
+     ',"poc_count":' + str.tostring(clusterCount) +
+     ',"sma' + str.tostring(smaLen) + '":' + str.tostring(sma, format.mintick) +
+     ',"volume":' + str.tostring(volume) +
+     ',"volume_avg":' + str.tostring(volAvg) +
+     ',"retrace_pct":' + str.tostring(side == "BUY" ? retraceDown : retraceUp, "#.##") +
+     ',"entry_mode":"' + entryMode + '"' +
+     ',"tf":"' + timeframe.period + '"' +
+     ',"time":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"}'
+
+if longSignal
+    alert(mt5Payload("BUY"), alert.freq_once_per_bar_close)
+if shortSignal
+    alert(mt5Payload("SELL"), alert.freq_once_per_bar_close)
+
+// Aviso informativo (no operativo) del inicio de cada correccion.
+corrPayload(dir) =>
+    '{"event":"correction_start","direction":"' + dir + '","symbol":"' + syminfo.ticker + '"' +
+     ',"price":' + str.tostring(close, format.mintick) +
+     ',"impulse_from":' + str.tostring(dir == "DOWN" ? lastPL : lastPH, format.mintick) +
+     ',"impulse_to":' + str.tostring(dir == "DOWN" ? lastPH : lastPL, format.mintick) +
+     ',"poc_cluster_low":' + str.tostring(clusterLow, format.mintick) +
+     ',"poc_cluster_high":' + str.tostring(clusterHigh, format.mintick) +
+     ',"tf":"' + timeframe.period + '"}'
+
+if corrDownStart
+    alert(corrPayload("DOWN"), alert.freq_once_per_bar_close)
+if corrUpStart
+    alert(corrPayload("UP"), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------- Visualizacion
+plot(sma, "SMA tendencia", color.new(color.orange, 0), 2)
+colM1 = color.new(color.gray, 40)
+colM5 = color.new(color.aqua, 30)
+colM15 = color.new(color.blue, 30)
+colM30 = color.new(color.purple, 30)
+colH1 = color.new(color.fuchsia, 20)
+colH4 = color.new(color.red, 10)
+colD = color.new(color.orange, 10)
+colW = color.new(color.lime, 10)
+colMN = color.new(color.yellow, 10)
+colY = color.new(color.white, 10)
+
+// display.pane: la etiqueta de la temporalidad va sobre el grafico, no en la escala de precios.
+pocDisplay = display.pane
+plot(useM1 ? pocM1 : na, "POC M1", colM1, 1, plot.style_circles, display = pocDisplay)
+plot(useM5 ? pocM5 : na, "POC M5", colM5, 1, plot.style_circles, display = pocDisplay)
+plot(useM15 ? pocM15 : na, "POC M15", colM15, 1, plot.style_circles, display = pocDisplay)
+plot(useM30 ? pocM30 : na, "POC M30", colM30, 1, plot.style_circles, display = pocDisplay)
+plot(useH1 ? pocH1 : na, "POC H1", colH1, 2, plot.style_circles, display = pocDisplay)
+plot(useH4 ? pocH4 : na, "POC H4", colH4, 2, plot.style_circles, display = pocDisplay)
+plot(useD ? pocD : na, "POC D", colD, 2, plot.style_circles, display = pocDisplay)
+plot(useW ? pocW : na, "POC S", colW, 2, plot.style_circles, display = pocDisplay)
+plot(useMN ? pocMN : na, "POC M", colMN, 2, plot.style_circles, display = pocDisplay)
+plot(useY ? pocY : na, "POC 12M", colY, 2, plot.style_circles, display = pocDisplay)
+
+// Una etiqueta persistente por temporalidad, reposicionada en la ultima vela.
+lblSize = labelSize == "small" ? size.small : labelSize == "normal" ? size.normal : size.tiny
+var array<label> pocLabels = array.new<label>()
+if barstate.islast
+    // `for ... to` cuenta hacia atras si el limite es menor que el inicio, asi que
+    // con el array vacio un `0 to size - 1` accederia al indice 0 inexistente.
+    for lbl in pocLabels
+        label.delete(lbl)
+    array.clear(pocLabels)
+
+updatePocLabel(enabled, price, name, col) =>
+    if barstate.islast and showPocLabels and enabled and not na(price)
+        // La punta de la linea es la ultima vela: la etiqueta arranca ahi hacia la derecha.
+        array.push(pocLabels, label.new(bar_index + labelOffset, price, name, xloc.bar_index,
+             yloc.price, color.new(color.black, 100), label.style_label_left, col, lblSize))
+
+updatePocLabel(useM1, pocM1, "M1", colM1)
+updatePocLabel(useM5, pocM5, "M5", colM5)
+updatePocLabel(useM15, pocM15, "M15", colM15)
+updatePocLabel(useM30, pocM30, "M30", colM30)
+updatePocLabel(useH1, pocH1, "H1", colH1)
+updatePocLabel(useH4, pocH4, "H4", colH4)
+updatePocLabel(useD, pocD, "D", colD)
+updatePocLabel(useW, pocW, "S", colW)
+updatePocLabel(useMN, pocMN, "M", colMN)
+updatePocLabel(useY, pocY, "12M", colY)
+
+pLow = plot(clusterLow, "Cluster low", color.new(color.teal, 60))
+pHigh = plot(clusterHigh, "Cluster high", color.new(color.teal, 60))
+fill(pLow, pHigh, color = hasCluster ? color.new(color.teal, 80) : na, title = "Zona de cluster")
+
+plotshape(longSignal, "BUY", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(shortSignal, "SELL", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(corrDownStart, "Inicio correccion bajista", shape.xcross, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+plotshape(corrUpStart, "Inicio correccion alcista", shape.xcross, location.belowbar, color.new(color.orange, 0), size = size.tiny)
+bgcolor(inPullDown ? color.new(color.orange, 92) : inPullUp ? color.new(color.yellow, 92) : na, title = "En correccion")
+
+// Tabla practicamente opaca; el texto nunca pasa del 70% de transparencia.
+tblHeadBg = color.new(color.gray, 10)
+tblBodyBg = color.new(color.black, 10)
+tblText = color.new(color.white, math.min(tableTextTransp, 70))
+
+var table info = table.new(position.top_right, 2, 7, border_width = 1, bgcolor = tblBodyBg,
+     frame_color = color.new(color.gray, 30), frame_width = 1)
+
+infoRow(row, titulo, valor) =>
+    table.cell(info, 0, row, titulo, bgcolor = tblHeadBg, text_color = tblText)
+    table.cell(info, 1, row, valor, bgcolor = tblBodyBg, text_color = tblText)
+
+if barstate.islast
+    infoRow(0, "POC en cluster", str.tostring(clusterCount) + " / " + str.tostring(array.size(pocs)))
+    infoRow(1, "Zona cluster", hasCluster ? str.tostring(clusterLow, format.mintick) + " - " + str.tostring(clusterHigh, format.mintick) : "sin cluster")
+    infoRow(2, "Tolerancia", str.tostring(tolerance, format.mintick))
+    infoRow(3, "Tendencia SMA", na(sma) ? "n/d" : close > sma ? "alcista" : "bajista")
+    infoRow(4, "Volumen vs media", na(volAvg) or volAvg == 0 ? "n/d" : str.tostring(volume / volAvg, "#.##") + "x")
+    infoRow(5, "Correccion", inPullDown ? "bajista en curso" : inPullUp ? "alcista en curso" : "ninguna")
+    infoRow(6, "Retroceso", na(retraceDown) and na(retraceUp) ? "n/d" : str.tostring(nz(retraceDown, nz(retraceUp)), "#.#") + "%")
