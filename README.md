@@ -34,7 +34,8 @@ For IBKR, enable *Configure > API > Enable ActiveX and Socket Clients* and point
 paper, 4001 Gateway live. The scanner connects read-only, so it can never place
 an order. IBKR forces a re-login roughly daily, so an unattended schedule needs
 IB Gateway kept alive (for example with IBC). Only strikes within 20% of spot
-are requested, to stay under IBKR's market data line limit.
+are requested, to stay under IBKR's market data line limit. Step-by-step setup
+against your own TWS is in [RUNBOOK-IBKR.md](RUNBOOK-IBKR.md).
 
 ### Alignment bands
 
